@@ -2,59 +2,32 @@ from __future__ import annotations
 
 import argparse
 import random
-import unicodedata
 from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
+from dataloder import Datas, Langs
 from model import PAD_IDX, START_IDX, STOI, UNK_IDX, NameRNN
-
-
-def to_ascii(name: str) -> str:
-    normalized = unicodedata.normalize("NFKD", name)
-    ascii_name = normalized.encode("ascii", "ignore").decode("ascii")
-    return " ".join(ascii_name.strip().split())
 
 
 def encode_name(name: str) -> list[int]:
     tokens = [START_IDX]
-    tokens.extend(STOI.get(ch, UNK_IDX) for ch in to_ascii(name))
+    tokens.extend(STOI.get(ch, UNK_IDX) for ch in name)
     return tokens if len(tokens) > 1 else [START_IDX, UNK_IDX]
 
 
-class NameDataset(Dataset):
-    def __init__(self, samples: list[tuple[list[int], int]]) -> None:
-        self.samples = samples
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> tuple[list[int], int]:
-        return self.samples[idx]
-
-
-def load_samples(data_dir: Path) -> tuple[list[tuple[list[int], int]], list[str]]:
-    files = sorted(data_dir.glob("*.txt"))
-    if not files:
-        raise FileNotFoundError(f"Keine Label-Dateien gefunden in: {data_dir}")
-
-    labels = [file.stem for file in files]
-    label_to_idx = {label: idx for idx, label in enumerate(labels)}
-
+def load_samples() -> tuple[list[tuple[list[int], int]], list[str]]:
+    labels = [Path(lang).stem for lang in Langs]
     samples: list[tuple[list[int], int]] = []
-    for file in files:
-        label = file.stem
-        label_idx = label_to_idx[label]
-        for line in file.read_text(encoding="utf-8").splitlines():
-            name = line.strip()
-            if not name:
-                continue
-            samples.append((encode_name(name), label_idx))
+    for name, onehot in Datas:
+        if 1 not in onehot:
+            continue
+        samples.append((encode_name(name), onehot.index(1)))
 
     if not samples:
-        raise ValueError(f"Keine Namen in den Dateien unter: {data_dir}")
+        raise ValueError("Keine Namen in Datas gefunden.")
     return samples, labels
 
 
@@ -66,9 +39,8 @@ def split_samples(
     rng.shuffle(shuffled)
 
     val_size = int(len(shuffled) * val_ratio)
-    if 0 < val_size < len(shuffled):
-        return shuffled[val_size:], shuffled[:val_size]
-    return shuffled, []
+    val_size = max(0, min(val_size, max(0, len(shuffled) - 1)))
+    return shuffled[val_size:], shuffled[:val_size]
 
 
 def collate_batch(
@@ -125,21 +97,46 @@ def run_epoch(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a GRU for name origin classification.")
-    parser.add_argument("--data-dir", type=Path, default=Path("data/names"))
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-
-    parser.add_argument("--embed-dim", type=int, default=64)
-    parser.add_argument("--hidden-size", type=int, default=128)
-    parser.add_argument("--num-layers", type=int, default=1)
-    parser.add_argument("--dropout", type=float, default=0.15)
-    parser.add_argument("--bidirectional", action="store_true")
-
     parser.add_argument("--save-path", type=Path, default=Path("name_rnn.pt"))
+    parser.add_argument("--plot-path", type=Path, default=Path("training_plot.png"))
     return parser.parse_args()
+
+
+def plot_history(history: dict[str, list[float]], plot_path: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Plot uebersprungen: matplotlib nicht installiert.")
+        return
+
+    epochs = list(range(1, len(history["train_loss"]) + 1))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].plot(epochs, history["train_loss"], label="train_loss")
+    if history["val_loss"]:
+        axes[0].plot(epochs, history["val_loss"], label="val_loss")
+    axes[0].set_title("Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(epochs, history["train_acc"], label="train_acc")
+    if history["val_acc"]:
+        axes[1].plot(epochs, history["val_acc"], label="val_acc")
+    axes[1].set_title("Accuracy")
+    axes[1].set_xlabel("Epoch")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=140)
+    plt.close(fig)
+    print(f"Plot gespeichert: {plot_path}")
 
 
 def main() -> None:
@@ -151,33 +148,29 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    samples, labels = load_samples(args.data_dir)
+    samples, labels = load_samples()
     train_samples, val_samples = split_samples(samples, args.val_ratio, args.seed)
 
     train_loader = DataLoader(
-        NameDataset(train_samples),
+        train_samples,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_batch,
     )
-    val_loader = DataLoader(
-        NameDataset(val_samples),
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_batch,
-    )
+    val_loader = None
+    if val_samples:
+        val_loader = DataLoader(
+            val_samples,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_batch,
+        )
 
-    model = NameRNN(
-        num_classes=len(labels),
-        embed_dim=args.embed_dim,
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        bidirectional=args.bidirectional,
-    ).to(device)
+    model = NameRNN(num_classes=len(labels)).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
     print(f"Device: {device}")
     print(
@@ -187,9 +180,14 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = run_epoch(model, train_loader, criterion, device, optimizer)
-        if val_loader.dataset:
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+
+        if val_loader is not None:
             with torch.inference_mode():
                 val_loss, val_acc = run_epoch(model, val_loader, criterion, device, optimizer=None)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
             print(
                 f"Epoch {epoch:02d}/{args.epochs} | "
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} | "
@@ -204,17 +202,11 @@ def main() -> None:
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "labels": labels,
-        "model_config": {
-            "num_classes": len(labels),
-            "embed_dim": args.embed_dim,
-            "hidden_size": args.hidden_size,
-            "num_layers": args.num_layers,
-            "dropout": args.dropout,
-            "bidirectional": args.bidirectional,
-        },
+        "model_config": {"num_classes": len(labels)},
     }
     torch.save(checkpoint, args.save_path)
     print(f"Modell gespeichert: {args.save_path}")
+    plot_history(history, args.plot_path)
 
 
 if __name__ == "__main__":
